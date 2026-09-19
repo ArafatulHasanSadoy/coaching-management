@@ -1,5 +1,6 @@
 import 'package:drift/drift.dart';
 
+import '../../core/app_settings.dart';
 import '../db/database.dart';
 import '../db/tables.dart';
 import 'ledger_service.dart';
@@ -12,12 +13,70 @@ class DueSummary {
     required this.unpaidInvoices,
     required this.totalDue,
     required this.monthsBehind,
+    this.creditBalance = 0,
   });
 
   final Student student;
   final List<Invoice> unpaidInvoices;
   final int totalDue;
   final int monthsBehind;
+
+  /// Money already taken and not yet claimed by any invoice. It is spent
+  /// automatically on the next charge, so it is shown at the counter rather
+  /// than netted silently out of [totalDue].
+  final int creditBalance;
+}
+
+/// What raising a month's fees actually did.
+///
+/// "Nothing happened" has two very different causes — everyone was already
+/// billed, or nobody has a fee set — and a centre setting up for the first time
+/// hits the second one immediately. Reporting only a count made both read as
+/// "done".
+class BillingResult {
+  const BillingResult({
+    required this.created,
+    required this.alreadyBilled,
+    required this.withoutFee,
+  });
+
+  final int created;
+  final int alreadyBilled;
+
+  /// Students enrolled but skipped because neither they nor their batch has a
+  /// monthly fee. Names, so the owner knows exactly whom to fix.
+  final List<String> withoutFee;
+}
+
+/// What one payment settled.
+///
+/// Returned rather than left for the caller to re-query, because the receipt
+/// has to name the months covered and the front desk has to be told
+/// immediately what is still owed.
+class CollectionResult {
+  const CollectionResult({
+    required this.payment,
+    required this.settled,
+    required this.credited,
+    required this.remainingDue,
+    this.creditUsed = 0,
+  });
+
+  final Payment payment;
+
+  /// Advance already on file that was spent in the same step, before this
+  /// payment. Printed on the receipt so the arithmetic on it adds up.
+  final int creditUsed;
+
+  /// Period keys this payment cleared or part-cleared, oldest first —
+  /// `['2026-07', '2026-08']`.
+  final List<String> settled;
+
+  /// Taka left over after every outstanding invoice was covered.
+  final int credited;
+
+  /// What the student still owes once this payment is applied.
+  final int remainingDue;
 }
 
 /// Raising charges and taking money.
@@ -123,16 +182,38 @@ class FeeService {
   Future<int> generateMonthlyInvoices({
     required String sessionId,
     required DateTime forMonth,
-    int dueDay = 10,
+    int? dueDay,
+  }) async =>
+      (await raiseMonthlyFees(
+        sessionId: sessionId,
+        forMonth: forMonth,
+        dueDay: dueDay,
+      ))
+          .created;
+
+  /// Raises a month's tuition for everyone enrolled, and says what it did.
+  Future<BillingResult> raiseMonthlyFees({
+    required String sessionId,
+    required DateTime forMonth,
+    int? dueDay,
   }) async {
     final period = periodKeyFor(forMonth);
+
+    // The centre's own due day, not a built-in one. Clamped to 28 so the day
+    // exists in February.
+    final settings = AppSettings(db: db, deviceId: deviceId);
+    final due = (dueDay ?? await settings.readInt(AppSettings.defaultDueDay))
+        .clamp(1, 28);
 
     return db.transaction(() async {
       final monthlyHead = await (db.select(db.feeHeads)
             ..where((t) => t.kind.equalsValue(FeeKind.monthly))
             ..limit(1))
           .getSingleOrNull();
-      if (monthlyHead == null) return 0;
+      if (monthlyHead == null) {
+        return const BillingResult(
+            created: 0, alreadyBilled: 0, withoutFee: []);
+      }
 
       final rows = await (db.select(db.enrollments).join([
         innerJoin(db.batches, db.batches.id.equalsExp(db.enrollments.batchId)),
@@ -151,17 +232,25 @@ class FeeService {
       final billed = {for (final i in already) i.studentId};
 
       var created = 0;
+      var alreadyBilled = 0;
+      final withoutFee = <String>[];
       for (final row in rows) {
         final enrollment = row.readTable(db.enrollments);
         final batch = row.readTable(db.batches);
         final student = row.readTable(db.students);
-        if (billed.contains(enrollment.studentId)) continue;
+        if (billed.contains(enrollment.studentId)) {
+          alreadyBilled++;
+          continue;
+        }
 
         // The student's own fee is the real one; the batch fee is only the
         // starting point the desk was offered when they were admitted.
         final gross =
             student.monthlyFee > 0 ? student.monthlyFee : batch.monthlyFee;
-        if (gross <= 0) continue;
+        if (gross <= 0) {
+          withoutFee.add(student.name);
+          continue;
+        }
 
         final discount = await _discountFor(
           studentId: enrollment.studentId,
@@ -179,7 +268,7 @@ class FeeService {
                 status: InvoiceStatus.unpaid,
                 deviceId: deviceId,
                 batchId: Value(batch.id),
-                dueOn: Value(DateTime(forMonth.year, forMonth.month, dueDay)),
+                dueOn: Value(DateTime(forMonth.year, forMonth.month, due)),
                 grossAmount: Value(gross),
                 discountAmount: Value(applied),
                 netAmount: Value(gross - applied),
@@ -196,6 +285,11 @@ class FeeService {
                 discount: Value(applied),
               ),
             );
+
+        // An advance the guardian already paid is spent here, the moment
+        // there is something to spend it on — the receipt told them it would
+        // be.
+        await _applyCredit(enrollment.studentId);
         created++;
       }
 
@@ -209,7 +303,11 @@ class FeeService {
           after: {'period': period, 'count': created},
         );
       }
-      return created;
+      return BillingResult(
+        created: created,
+        alreadyBilled: alreadyBilled,
+        withoutFee: withoutFee,
+      );
     });
   }
 
@@ -237,7 +335,7 @@ class FeeService {
   /// the ledger entry — happens in one transaction. A payment that updated the
   /// student's balance but never reached the ledger, or vice versa, is exactly
   /// the kind of drift that makes a centre stop trusting the app.
-  Future<Payment> collect({
+  Future<CollectionResult> collect({
     required String studentId,
     required int amount,
     required PaymentMethod method,
@@ -289,7 +387,13 @@ class FeeService {
         sourceId: payment.id,
       );
 
-      if (invoiceId != null) await _refreshInvoice(invoiceId);
+      // Spread the money across what is actually owed, oldest month first.
+      // `invoiceId`, when given, is only a hint about where to start.
+      final allocated = await _allocate(
+        payment: payment,
+        studentId: studentId,
+        preferInvoiceId: invoiceId,
+      );
 
       await db.recordChange(
         entity: 'payments',
@@ -302,11 +406,251 @@ class FeeService {
           'amount': amount,
           'method': method.name,
           'studentId': studentId,
+          'settled': allocated.settled,
+          'credited': allocated.credited,
         },
       );
 
-      return payment;
+      return allocated;
     });
+  }
+
+  /// Applies one payment to a student's outstanding invoices, oldest first.
+  ///
+  /// The waterfall is the whole point: a guardian paying three months at once
+  /// expects three months cleared, and the previous behaviour — attaching the
+  /// entire amount to the single oldest invoice — left the other two showing
+  /// as unpaid while that one showed as overpaid. Anything left when every
+  /// invoice is covered becomes a credit rather than inflating the last one.
+  Future<CollectionResult> _allocate({
+    required Payment payment,
+    required String studentId,
+    String? preferInvoiceId,
+  }) async {
+    // Credit already held is older money than this payment, so it settles
+    // first. Otherwise a guardian with an advance on file who pays again
+    // would have the new money cover a month the advance should have.
+    final creditBefore = await creditBalanceFor(studentId);
+    await _applyCredit(studentId);
+    final creditUsed = creditBefore - await creditBalanceFor(studentId);
+
+    final outstanding = await (db.select(db.invoices)
+          ..where((t) =>
+              t.studentId.equals(studentId) &
+              t.deletedAt.isNull() &
+              t.status.equalsValue(InvoiceStatus.paid).not() &
+              t.status.equalsValue(InvoiceStatus.waived).not())
+          ..orderBy([(t) => OrderingTerm.asc(t.periodKey)]))
+        .get();
+
+    // A caller that named an invoice wants that one settled first; everything
+    // else still follows in period order behind it.
+    if (preferInvoiceId != null) {
+      final index = outstanding.indexWhere((i) => i.id == preferInvoiceId);
+      if (index > 0) {
+        final preferred = outstanding.removeAt(index);
+        outstanding.insert(0, preferred);
+      }
+    }
+
+    var left = payment.amount;
+    final settled = <String>[];
+    final touched = <String>[];
+
+    for (final invoice in outstanding) {
+      if (left <= 0) break;
+      final owed = invoice.netAmount - invoice.paidAmount;
+      if (owed <= 0) continue;
+
+      final take = left < owed ? left : owed;
+      await db.into(db.paymentAllocations).insert(
+            PaymentAllocationsCompanion.insert(
+              paymentId: payment.id,
+              invoiceId: invoice.id,
+              amount: take,
+              deviceId: deviceId,
+            ),
+          );
+      left -= take;
+      settled.add(invoice.periodKey);
+      touched.add(invoice.id);
+    }
+
+    for (final id in touched) {
+      await _refreshInvoice(id);
+    }
+
+    if (left > 0) {
+      await db.into(db.studentCredits).insert(
+            StudentCreditsCompanion.insert(
+              studentId: studentId,
+              amount: left,
+              deviceId: deviceId,
+              paymentId: Value(payment.id),
+              reason: const Value('Paid more than was owed'),
+            ),
+          );
+    }
+
+    final remaining = await _outstandingFor(studentId);
+
+    // The payment row carries a short summary of what it paid for, so the
+    // record reads correctly on its own — in an export, or to anyone who
+    // looks at the row without joining through the allocations. Written in
+    // the same transaction that created the row, before anything can read it.
+    settled.sort();
+    final summary = settled.isEmpty
+        ? 'Advance'
+        : settled.length == 1
+            ? settled.single
+            : '${settled.first} to ${settled.last}';
+    await (db.update(db.payments)..where((t) => t.id.equals(payment.id)))
+        .write(PaymentsCompanion(forPeriod: Value(summary)));
+
+    return CollectionResult(
+      payment: payment.copyWith(forPeriod: summary),
+      settled: settled,
+      credited: left,
+      remainingDue: remaining,
+      creditUsed: creditUsed,
+    );
+  }
+
+  /// Spends a student's held credit on their outstanding invoices.
+  ///
+  /// Credit is always spent in the name of the payment that created it, so an
+  /// allocation made from credit points at a real receipt. That is what makes
+  /// voiding work: cancel the payment and every invoice its money reached —
+  /// directly or as credit — goes back to owing.
+  Future<void> _applyCredit(String studentId) async {
+    final rows = await (db.select(db.studentCredits)
+          ..where((t) =>
+              t.studentId.equals(studentId) &
+              t.deletedAt.isNull() &
+              t.paymentId.isNotNull())
+          ..orderBy([(t) => OrderingTerm.asc(t.createdAt)]))
+        .get();
+    if (rows.isEmpty) return;
+
+    // Net per source payment, oldest first.
+    final available = <String, int>{};
+    for (final row in rows) {
+      available.update(row.paymentId!, (v) => v + row.amount,
+          ifAbsent: () => row.amount);
+    }
+    available.removeWhere((_, amount) => amount <= 0);
+    if (available.isEmpty) return;
+
+    final outstanding = await (db.select(db.invoices)
+          ..where((t) =>
+              t.studentId.equals(studentId) &
+              t.deletedAt.isNull() &
+              t.status.equalsValue(InvoiceStatus.paid).not() &
+              t.status.equalsValue(InvoiceStatus.waived).not())
+          ..orderBy([(t) => OrderingTerm.asc(t.periodKey)]))
+        .get();
+
+    final owed = {for (final i in outstanding) i.id: i.netAmount - i.paidAmount};
+    final touched = <String>{};
+
+    for (final source in available.entries) {
+      var left = source.value;
+      for (final invoice in outstanding) {
+        if (left <= 0) break;
+        final room = owed[invoice.id]!;
+        if (room <= 0) continue;
+
+        final take = left < room ? left : room;
+        await db.into(db.paymentAllocations).insert(
+              PaymentAllocationsCompanion.insert(
+                paymentId: source.key,
+                invoiceId: invoice.id,
+                amount: take,
+                deviceId: deviceId,
+                fromCredit: const Value(true),
+              ),
+            );
+        await db.into(db.studentCredits).insert(
+              StudentCreditsCompanion.insert(
+                studentId: studentId,
+                amount: -take,
+                deviceId: deviceId,
+                paymentId: Value(source.key),
+                reason: Value('Used against ${invoice.periodKey}'),
+              ),
+            );
+        owed[invoice.id] = room - take;
+        left -= take;
+        touched.add(invoice.id);
+      }
+    }
+
+    for (final id in touched) {
+      await _refreshInvoice(id);
+    }
+  }
+
+  /// Credit a student holds right now.
+  Future<int> creditBalanceFor(String studentId) async {
+    final rows = await (db.select(db.studentCredits)
+          ..where((t) => t.studentId.equals(studentId) & t.deletedAt.isNull()))
+        .get();
+    final total = rows.fold<int>(0, (sum, r) => sum + r.amount);
+    return total < 0 ? 0 : total;
+  }
+
+  /// What a student owes, read inside a transaction without building a
+  /// [DueSummary].
+  Future<int> _outstandingFor(String studentId) async {
+    final invoices = await (db.select(db.invoices)
+          ..where((t) =>
+              t.studentId.equals(studentId) &
+              t.deletedAt.isNull() &
+              t.status.equalsValue(InvoiceStatus.paid).not() &
+              t.status.equalsValue(InvoiceStatus.waived).not()))
+        .get();
+    return invoices.fold<int>(
+        0, (sum, i) => sum + (i.netAmount - i.paidAmount));
+  }
+
+  /// The period keys one payment settled, oldest first.
+  ///
+  /// Needed whenever a receipt is rebuilt after the fact — a reprint has to
+  /// say the same months the original did.
+  ///
+  /// Only what the money settled on the day, by default — which is what the
+  /// original receipt printed. Months it reached later as advance are left
+  /// out unless [includeAdvance] asks for them.
+  Future<List<String>> periodsSettledBy(
+    String paymentId, {
+    bool includeAdvance = false,
+  }) async {
+    final rows = await (db.select(db.paymentAllocations).join([
+      innerJoin(
+        db.invoices,
+        db.invoices.id.equalsExp(db.paymentAllocations.invoiceId),
+      ),
+    ])
+          ..where(db.paymentAllocations.paymentId.equals(paymentId) &
+              db.paymentAllocations.deletedAt.isNull() &
+              (includeAdvance
+                  ? const Constant(true)
+                  : db.paymentAllocations.fromCredit.equals(false)))
+          ..orderBy([OrderingTerm.asc(db.invoices.periodKey)]))
+        .get();
+
+    return [for (final r in rows) r.readTable(db.invoices).periodKey];
+  }
+
+  /// How much of a payment was held as advance when it was taken.
+  Future<int> advanceCreatedBy(String paymentId) async {
+    final rows = await (db.select(db.studentCredits)
+          ..where((t) =>
+              t.paymentId.equals(paymentId) &
+              t.deletedAt.isNull() &
+              t.amount.isBiggerThanValue(0)))
+        .get();
+    return rows.fold<int>(0, (sum, r) => sum + r.amount);
   }
 
   /// Voids a payment. The row stays, the number stays used, the money is undone.
@@ -330,7 +674,38 @@ class FeeService {
         reason: reason,
       );
 
-      if (payment.invoiceId != null) await _refreshInvoice(payment.invoiceId!);
+      // Every invoice this payment touched has to be recomputed, not just
+      // the one named on the row. The allocations stay — they are the record
+      // of what the money did before it was voided — and `_refreshInvoice`
+      // ignores them because the payment is now cancelled.
+      final allocations = await (db.select(db.paymentAllocations)
+            ..where((t) =>
+                t.paymentId.equals(payment.id) & t.deletedAt.isNull()))
+          .get();
+
+      final invoiceIds = {
+        for (final a in allocations) a.invoiceId,
+        if (payment.invoiceId != null) payment.invoiceId!,
+      };
+      for (final id in invoiceIds) {
+        await _refreshInvoice(id);
+      }
+
+      // A credit created by an overpayment dies with the payment.
+      final credits = await (db.select(db.studentCredits)
+            ..where((t) =>
+                t.paymentId.equals(payment.id) & t.deletedAt.isNull()))
+          .get();
+      for (final credit in credits) {
+        await (db.update(db.studentCredits)
+              ..where((t) => t.id.equals(credit.id)))
+            .write(
+          StudentCreditsCompanion(
+            deletedAt: Value(DateTime.now()),
+            updatedAt: Value(DateTime.now()),
+          ),
+        );
+      }
 
       await db.recordChange(
         entity: 'payments',
@@ -351,14 +726,23 @@ class FeeService {
         .getSingleOrNull();
     if (invoice == null) return;
 
-    final payments = await (db.select(db.payments)
-          ..where((t) =>
-              t.invoiceId.equals(invoiceId) &
-              t.isCancelled.equals(false) &
-              t.deletedAt.isNull()))
+    // Summed from allocations, not from payments: one payment may settle
+    // several invoices, so "every payment pointing at this invoice" would
+    // count money that went to other months.
+    final rows = await (db.select(db.paymentAllocations).join([
+      innerJoin(
+        db.payments,
+        db.payments.id.equalsExp(db.paymentAllocations.paymentId),
+      ),
+    ])
+          ..where(db.paymentAllocations.invoiceId.equals(invoiceId) &
+              db.paymentAllocations.deletedAt.isNull() &
+              db.payments.isCancelled.equals(false) &
+              db.payments.deletedAt.isNull()))
         .get();
 
-    final paid = payments.fold<int>(0, (sum, p) => sum + p.amount);
+    final paid = rows.fold<int>(
+        0, (sum, r) => sum + r.readTable(db.paymentAllocations).amount);
     final status = paid <= 0
         ? InvoiceStatus.unpaid
         : paid >= invoice.netAmount
@@ -379,7 +763,21 @@ class FeeService {
   /// Called only inside a transaction, so two payments taken at once cannot be
   /// handed the same number.
   Future<String> _allocateReceiptNumber() async {
-    final series = await (db.select(db.receiptSeries)..limit(1)).getSingle();
+    // `ReceiptSeries` is keyed by prefix so a centre can run more than one
+    // book. Reading "the first row" worked only while there was exactly one,
+    // and would have silently handed out numbers from the wrong series the
+    // moment a second appeared.
+    final prefix = await _receiptPrefix();
+    final existing = await (db.select(db.receiptSeries)
+          ..where((t) => t.prefix.equals(prefix))
+          ..limit(1))
+        .getSingleOrNull();
+
+    final series = existing ??
+        await db.into(db.receiptSeries).insertReturning(
+          ReceiptSeriesCompanion.insert(prefix: prefix, deviceId: deviceId),
+        );
+
     final number = series.nextNumber;
 
     await (db.update(db.receiptSeries)..where((t) => t.id.equals(series.id)))
@@ -391,6 +789,22 @@ class FeeService {
     );
 
     return '${series.prefix}-${number.toString().padLeft(series.padding, '0')}';
+  }
+
+  /// The prefix the centre has configured, falling back to whatever series
+  /// already exists so an upgrade keeps numbering where it left off.
+  Future<String> _receiptPrefix() async {
+    final setting = await (db.select(db.settings)
+          ..where((t) =>
+              t.key.equals(AppSettings.receiptPrefix) & t.deletedAt.isNull()))
+        .getSingleOrNull();
+    if (setting != null && setting.value.trim().isNotEmpty) {
+      return setting.value.trim();
+    }
+
+    final existing = await (db.select(db.receiptSeries)..limit(1))
+        .getSingleOrNull();
+    return existing?.prefix ?? 'R';
   }
 
   // ---- dues ------------------------------------------------------------
@@ -413,6 +827,7 @@ class FeeService {
       unpaidInvoices: invoices,
       totalDue: total,
       monthsBehind: invoices.length,
+      creditBalance: await creditBalanceFor(student.id),
     );
   }
 

@@ -407,6 +407,50 @@ class Payments extends Table with SyncableTable {
   TextColumn get note => text().withDefault(const Constant(''))();
 }
 
+/// Which invoices a payment actually settled, and by how much.
+///
+/// A guardian who pays three months at once is the hardest question the front
+/// desk faces — "which months did that cover, and what is left?" — and it
+/// cannot be answered from [Payments] alone, because one payment routinely
+/// clears several invoices and one invoice is routinely cleared by several
+/// payments. So the allocation is a row of its own rather than a foreign key
+/// on either side.
+///
+/// [Payments.invoiceId] stays for the common single-invoice case and for rows
+/// written before this table existed; the allocations are the truth.
+@TableIndex(name: 'idx_allocation_payment', columns: {#paymentId})
+@TableIndex(name: 'idx_allocation_invoice', columns: {#invoiceId})
+class PaymentAllocations extends Table with SyncableTable {
+  TextColumn get paymentId => text().references(Payments, #id)();
+  TextColumn get invoiceId => text().references(Invoices, #id)();
+
+  /// Whole Taka of this payment applied to that invoice.
+  IntColumn get amount => integer()();
+
+  /// Whether the money reached this invoice later, as advance held from the
+  /// payment, rather than on the day it was paid.
+  ///
+  /// A reprinted receipt has to say what the original said. Without this, a
+  /// receipt for September reprinted after its advance was spent on October
+  /// would claim to have been "for September, October".
+  BoolColumn get fromCredit => boolean().withDefault(const Constant(false))();
+}
+
+/// Money taken that no invoice claimed yet.
+///
+/// A guardian who hands over a round ৳5000 against ৳4600 of dues has not made
+/// a mistake, and refusing the note or silently inflating an invoice are both
+/// wrong. The surplus sits here until the owner says what it is — held against
+/// next month, or refunded.
+class StudentCredits extends Table with SyncableTable {
+  TextColumn get studentId => text().references(Students, #id)();
+  TextColumn get paymentId => text().nullable().references(Payments, #id)();
+
+  /// Positive when credit is created, negative when it is spent or refunded.
+  IntColumn get amount => integer()();
+  TextColumn get reason => text().withDefault(const Constant(''))();
+}
+
 /// The receipt number counter. One row per prefix.
 class ReceiptSeries extends Table with SyncableTable {
   TextColumn get prefix => text().withLength(max: 20).unique()();

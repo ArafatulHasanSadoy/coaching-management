@@ -2,9 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/bootstrap.dart';
+import '../../core/money_guard.dart';
 import '../../core/sections.dart';
 import '../../data/db/database.dart';
 import '../../data/db/tables.dart';
+import '../../data/documents/document_engine.dart';
+import '../../data/documents/receipt_document.dart';
 import '../finance/collect_fee_screen.dart';
 
 /// The things a student's record can have done to it.
@@ -117,6 +120,8 @@ class StudentActions extends ConsumerWidget {
     final phone = TextEditingController(text: student.guardianPhone);
     final school = TextEditingController(text: student.school);
     final notes = TextEditingController(text: student.notes);
+    final fee = TextEditingController(
+        text: student.monthlyFee > 0 ? '${student.monthlyFee}' : '');
 
     final saved = await showModalBottomSheet<bool>(
       context: context,
@@ -140,7 +145,6 @@ class StudentActions extends ConsumerWidget {
                 (guardian, 'Guardian name', null),
                 (phone, 'Guardian phone', TextInputType.phone),
                 (school, 'School / college', null),
-                (notes, 'Notes', null),
               ]) ...[
                 TextField(
                   controller: controller,
@@ -152,6 +156,29 @@ class StudentActions extends ConsumerWidget {
                 ),
                 const SizedBox(height: 12),
               ],
+              // Agreed fees change mid-year — a scholarship, a sibling
+              // joining — so this has to be editable after admission.
+              TextField(
+                controller: fee,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: 'Monthly fee',
+                  prefixText: '৳ ',
+                  helperText: 'Applies from the next month billed. Months '
+                      'already billed keep their amount.',
+                  helperMaxLines: 2,
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: notes,
+                decoration: const InputDecoration(
+                  labelText: 'Notes',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
               SizedBox(
                 width: double.infinity,
                 child: FilledButton(
@@ -173,6 +200,7 @@ class StudentActions extends ConsumerWidget {
           guardianPhone: phone.text.trim(),
           school: school.text.trim(),
           notes: notes.text.trim(),
+          monthlyFee: int.tryParse(fee.text.trim()) ?? student.monthlyFee,
         );
     onChanged();
   }
@@ -346,12 +374,21 @@ class _SiblingPickerState extends ConsumerState<_SiblingPicker> {
       );
 }
 
-class _ReceiptHistory extends ConsumerWidget {
+class _ReceiptHistory extends ConsumerStatefulWidget {
   const _ReceiptHistory({required this.student});
   final Student student;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_ReceiptHistory> createState() => _ReceiptHistoryState();
+}
+
+class _ReceiptHistoryState extends ConsumerState<_ReceiptHistory> {
+  int _reloads = 0;
+
+  Student get student => widget.student;
+
+  @override
+  Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
     return Scaffold(
@@ -360,6 +397,7 @@ class _ReceiptHistory extends ConsumerWidget {
         title: 'Receipts — ${student.name}',
       ),
       body: FutureBuilder<List<Payment>>(
+        key: ValueKey(_reloads),
         future: ref.read(feeServiceProvider).paymentsFor(student.id),
         builder: (context, snapshot) {
           final payments = snapshot.data;
@@ -398,11 +436,136 @@ class _ReceiptHistory extends ConsumerWidget {
                     color: payment.isCancelled ? theme.colorScheme.error : null,
                   ),
                 ),
+                onTap: () => _open(payment),
               );
             },
           );
         },
       ),
     );
+  }
+
+  /// What can be done with a receipt that has already been written.
+  ///
+  /// Reprinting and voiding both existed in the services and neither could be
+  /// reached: the guardian who loses a receipt and the payment typed against
+  /// the wrong student are both ordinary days at the counter.
+  Future<void> _open(Payment payment) async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: Text('Receipt ${payment.receiptNo}',
+                  style: Theme.of(context).textTheme.titleMedium),
+              subtitle: Text('৳${payment.amount} · ${student.name}'),
+            ),
+            const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.print_outlined),
+              title: const Text('Print a copy'),
+              subtitle: const Text('Stamped DUPLICATE'),
+              onTap: () => Navigator.pop(context, 'print'),
+            ),
+            if (!payment.isCancelled)
+              ListTile(
+                leading: const Icon(Icons.undo),
+                title: const Text('Void this receipt'),
+                subtitle: const Text(
+                    'The number stays used and the money is reversed'),
+                onTap: () => Navigator.pop(context, 'void'),
+              ),
+          ],
+        ),
+      ),
+    );
+
+    if (choice == 'print') await _reprint(payment);
+    if (choice == 'void') await _void(payment);
+  }
+
+  Future<void> _reprint(Payment payment) async {
+    final engine = ref.read(documentEngineProvider);
+    // A duplicate says what the original said: the months paid on the day
+    // and the advance held — not where that advance went afterwards.
+    final fees = ref.read(feeServiceProvider);
+    final settled = await fees.periodsSettledBy(payment.id);
+    final advance = await fees.advanceCreatedBy(payment.id);
+    final placement = await ref.read(studentsProvider).placementOf(student.id);
+
+    final html = ReceiptDocument(engine: engine).build(
+      payment: payment,
+      student: student,
+      settledPeriods: settled,
+      credited: advance,
+      batchName: placement.batch,
+      className: placement.schoolClass,
+      isDuplicate: true,
+    );
+    await engine.printDocument(
+      html,
+      jobName: 'Receipt ${payment.receiptNo} (copy)',
+      paper: PaperSize.a5,
+    );
+  }
+
+  Future<void> _void(Payment payment) async {
+    final reason = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Void receipt ${payment.receiptNo}?'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'The receipt keeps its number and stays in the history, marked '
+              'cancelled. The money is reversed and anything it paid goes '
+              'back to being owed.',
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: reason,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Why',
+                hintText: 'Entered twice',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Keep it'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+            ),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Void'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    final done = await runMoneyAction(
+      context,
+      what: 'voiding this receipt',
+      () => ref.read(feeServiceProvider).cancelPayment(
+            payment,
+            reason: reason.text.trim().isEmpty
+                ? 'No reason given'
+                : reason.text.trim(),
+          ),
+    );
+    if (!done || !mounted) return;
+    setState(() => _reloads++);
   }
 }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/bootstrap.dart';
+import '../../core/money_guard.dart';
 import '../../core/sections.dart';
 import '../../data/db/tables.dart';
 import '../../data/finance/payroll_service.dart';
@@ -169,14 +170,19 @@ class _PayrollScreenState extends ConsumerState<PayrollScreen> {
         ),
       ),
     );
-    if (ok != true) return;
+    if (ok != true || !mounted) return;
 
-    await ref.read(expenseServiceProvider).paySalary(
-          staffId: line.staff.id,
-          accountId: accountId,
-          periodKey: line.periodKey,
-          grossAmount: int.tryParse(amount.text) ?? line.outstanding,
-        );
+    final paid = await runMoneyWrite(
+      context,
+      what: 'this payment',
+      () => ref.read(expenseServiceProvider).paySalary(
+            staffId: line.staff.id,
+            accountId: accountId,
+            periodKey: line.periodKey,
+            grossAmount: int.tryParse(amount.text) ?? line.outstanding,
+          ),
+    );
+    if (paid == null) return;
     setState(() => _reloads++);
   }
 }

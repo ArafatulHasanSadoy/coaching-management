@@ -13,6 +13,7 @@ import 'package:drift/native.dart';
 import 'package:drift/remote.dart';
 import 'package:sqlite3/sqlite3.dart' as sqlite3;
 
+import '../finance/allocation_rebuild.dart';
 import 'tables.dart';
 
 part 'database.g.dart';
@@ -60,6 +61,8 @@ class EncryptionUnavailableException implements Exception {
     Invoices,
     InvoiceItems,
     Payments,
+    PaymentAllocations,
+    StudentCredits,
     ReceiptSeries,
     Accounts,
     LedgerEntries,
@@ -137,7 +140,7 @@ class AppDatabase extends _$AppDatabase {
   factory AppDatabase.memory() => AppDatabase(NativeDatabase.memory());
 
   @override
-  int get schemaVersion => 8;
+  int get schemaVersion => 10;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -275,6 +278,37 @@ class AppDatabase extends _$AppDatabase {
             if (from >= 4) {
               await m.addColumn(classSessions, classSessions.kind);
               await m.addColumn(classSessions, classSessions.durationMinutes);
+            }
+          }
+
+          // v9 records which invoices a payment actually settled. Before this,
+          // a payment covering three months was attached to one of them and
+          // the other two stayed unpaid — the centre's single most common
+          // bookkeeping mistake.
+          if (from < 9) {
+            await m.createTable(paymentAllocations);
+            await m.createTable(studentCredits);
+            await m.createIndex(idxAllocationPayment);
+            await m.createIndex(idxAllocationInvoice);
+
+            // Existing payments predate allocations, and some of them carry
+            // the very mistake v9 fixes. Re-apply every one through today's
+            // waterfall rather than copying the old single-invoice link.
+            await rebuildAllocations(this);
+          }
+
+          // v10 marks which allocations were made from advance. A database
+          // that ran the pre-release v9 also carries allocations built by an
+          // earlier, wrong backfill — it dropped payments taken before any
+          // invoice existed — so those are recomputed from the payments
+          // themselves. Nothing released ever ran that v9; this is repair,
+          // not routine.
+          if (from < 10) {
+            if (from >= 9) {
+              await m.addColumn(paymentAllocations, paymentAllocations.fromCredit);
+              await customStatement('DELETE FROM payment_allocations');
+              await customStatement('DELETE FROM student_credits');
+              await rebuildAllocations(this);
             }
           }
         },

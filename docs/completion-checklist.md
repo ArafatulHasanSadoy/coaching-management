@@ -38,11 +38,19 @@ built **and** covered by a test or verified on device.
 
 ## Carried from Stages 4–8
 - [x] Per-class teacher pay computed from the class-taken register
-- [x] Payment history and cancellation from the UI
-- [x] Month-end lock
+- [x] Payment history, reprint and cancellation from the UI
+- [x] Month-end lock, and a readable message when a write hits one
 - [x] Staff edit and deactivate; staff attendance screen
-- [x] Expense list and cancellation
+- [x] Expense list and void (Finance → Expenses this month) — added in
+      Release 2; before that there was no expense list on any screen, only
+      the Expenses report
 - [x] Reports module
+
+> **A note on this file.** Until Release 2 it claimed "payment history and
+> cancellation from the UI" and "expense list and cancellation" while neither
+> cancellation path had a call site anywhere in `lib/features/`. A checklist
+> that overstates completion is how the next gap gets missed, so entries here
+> now say what is reachable from a screen, not what exists in a service.
 
 ## Deliberately not doing now
 - Automatic cloud backup — needs a backend; Phase 2 in the plan. Manual share

@@ -240,6 +240,27 @@ class StudentsRepository {
             ..limit(1))
           .getSingleOrNull();
 
+  /// The batch and class a student currently sits in, as names.
+  ///
+  /// Every document that identifies a student to a guardian needs both —
+  /// guardians know their child by class and section, and a receipt with
+  /// those blank looks unfinished even when the money is right.
+  Future<({String batch, String schoolClass})> placementOf(
+      String studentId) async {
+    final enrollment = await activeEnrollment(studentId);
+    if (enrollment == null) return (batch: '', schoolClass: '');
+
+    final batch = await (db.select(db.batches)
+          ..where((t) => t.id.equals(enrollment.batchId)))
+        .getSingleOrNull();
+    if (batch == null) return (batch: '', schoolClass: '');
+
+    final schoolClass = await (db.select(db.classes)
+          ..where((t) => t.id.equals(batch.classId)))
+        .getSingleOrNull();
+    return (batch: batch.name, schoolClass: schoolClass?.name ?? '');
+  }
+
   Stream<List<Student>> watchBatchRoster(String batchId) {
     final query = db.select(db.students).join([
       innerJoin(
@@ -305,8 +326,16 @@ class StudentsRepository {
       );
 
       await _audit(student.id, ChangeOp.update, 'edited',
-          before: {'name': student.name, 'phone': student.guardianPhone},
-          after: {'name': name ?? student.name, 'phone': guardian});
+          before: {
+            'name': student.name,
+            'phone': student.guardianPhone,
+            'monthlyFee': student.monthlyFee,
+          },
+          after: {
+            'name': name ?? student.name,
+            'phone': guardian,
+            'monthlyFee': monthlyFee ?? student.monthlyFee,
+          });
     });
   }
 

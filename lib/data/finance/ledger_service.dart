@@ -115,10 +115,44 @@ class LedgerService {
               t.deletedAt.isNull()))
         .get();
 
+    // A reversal undoes the side its original was on. Classifying by sign
+    // alone turned a voided fee into an "expense" and a voided expense into
+    // "income" — the balance stayed right while both totals went wrong, which
+    // is the worst kind of wrong because nothing looks broken. The original
+    // may sit outside the range (voiding last month's receipt today), so it
+    // is looked up rather than assumed to be in `rows`.
+    final reversedIds = {
+      for (final r in rows)
+        if (r.reversesId != null) r.reversesId!,
+    };
+    final originals = reversedIds.isEmpty
+        ? const <String, LedgerEntry>{}
+        : {
+            for (final e in await (db.select(db.ledgerEntries)
+                  ..where((t) => t.id.isIn(reversedIds)))
+                .get())
+              e.id: e,
+          };
+
     var income = 0;
     var expense = 0;
     for (final r in rows) {
-      if (r.amount >= 0) {
+      // Moving money between the centre's own accounts earns and costs
+      // nothing.
+      if (r.kind == LedgerKind.transfer) continue;
+
+      final original = r.reversesId == null ? null : originals[r.reversesId];
+      final wasIncome = original == null ? r.amount >= 0 : original.amount >= 0;
+
+      if (original != null) {
+        // r.amount is the opposite sign of the original, so adding it to
+        // the original's side is exactly "take it back off".
+        if (wasIncome) {
+          income += r.amount;
+        } else {
+          expense -= r.amount;
+        }
+      } else if (wasIncome) {
         income += r.amount;
       } else {
         expense += -r.amount;

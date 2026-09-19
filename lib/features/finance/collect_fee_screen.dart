@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app/bootstrap.dart';
 import '../../app/lock_controller.dart';
 import '../../core/phone.dart';
+import '../../core/money_guard.dart';
 import '../../core/sections.dart';
 import '../../data/db/database.dart';
 import '../../data/db/tables.dart';
@@ -72,7 +73,10 @@ class _CollectFeeScreenState extends ConsumerState<CollectFeeScreen> {
       _results = null;
       // Pre-filled with what is owed: the overwhelmingly common case is a
       // guardian clearing the balance, and making them state it is friction.
-      _amount.text = dues.totalDue > 0 ? '${dues.totalDue}' : '';
+      // What the guardian actually has to hand over: any advance on file is
+      // spent first, so it comes off the suggested amount.
+      final toPay = dues.totalDue - dues.creditBalance;
+      _amount.text = toPay > 0 ? '$toPay' : '';
     });
   }
 
@@ -86,7 +90,10 @@ class _CollectFeeScreenState extends ConsumerState<CollectFeeScreen> {
       final previousDue = _dues?.totalDue ?? 0;
       final user = ref.read(currentUserProvider);
 
-      final payment = await ref.read(feeServiceProvider).collect(
+      final result = await runMoneyWrite(
+        context,
+        what: 'this payment',
+        () => ref.read(feeServiceProvider).collect(
             studentId: _selected!.id,
             invoiceId: oldest?.id,
             amount: amount,
@@ -94,23 +101,54 @@ class _CollectFeeScreenState extends ConsumerState<CollectFeeScreen> {
             accountId: _accountId!,
             reference: _reference.text.trim(),
             receivedBy: user?.name ?? '',
-            forPeriod: oldest?.periodKey ?? '',
-          );
+            // What the money actually cleared, not a guess made before it was
+            // applied — this is the line a guardian argues about.
+            forPeriod: '',
+          ),
+      );
 
-      if (!mounted) return;
-      await _offerReceipt(payment, previousDue);
+      if (result == null || !mounted) return;
+      await _offerReceipt(result, previousDue);
       if (mounted) Navigator.of(context).pop();
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
-  Future<void> _offerReceipt(Payment payment, int previousDue) async {
+  Future<void> _offerReceipt(CollectionResult result, int previousDue) async {
+    final payment = result.payment;
+    final covered = result.settled.map(ReceiptDocument.monthLabel).join(', ');
+
     final print = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text('Received ৳${payment.amount}'),
-        content: Text('Receipt ${payment.receiptNo}'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Receipt ${payment.receiptNo}'),
+            if (covered.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text('Cleared $covered'),
+            ],
+            if (result.credited > 0) ...[
+              const SizedBox(height: 8),
+              Text('৳${result.credited} kept as advance'),
+            ],
+            const SizedBox(height: 8),
+            Text(
+              result.remainingDue > 0
+                  ? 'Still due ৳${result.remainingDue}'
+                  : 'Nothing left owing',
+              style: TextStyle(
+                color: result.remainingDue > 0
+                    ? Theme.of(context).colorScheme.error
+                    : null,
+              ),
+            ),
+          ],
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -127,13 +165,18 @@ class _CollectFeeScreenState extends ConsumerState<CollectFeeScreen> {
     if (print != true || !mounted) return;
 
     final engine = ref.read(documentEngineProvider);
-    final (batchName, className) = await _placement(_selected!.id);
+    final placement =
+        await ref.read(studentsProvider).placementOf(_selected!.id);
     final html = ReceiptDocument(engine: engine).build(
       payment: payment,
       student: _selected!,
       previousDue: previousDue,
-      batchName: batchName,
-      className: className,
+      batchName: placement.batch,
+      className: placement.schoolClass,
+      settledPeriods: result.settled,
+      remainingDue: result.remainingDue,
+      credited: result.credited,
+      creditUsed: result.creditUsed,
     );
     await engine.printDocument(
       html,
@@ -142,26 +185,6 @@ class _CollectFeeScreenState extends ConsumerState<CollectFeeScreen> {
     );
   }
 
-  /// The batch and class a receipt should name.
-  ///
-  /// Guardians identify their child by class and section, so a receipt with
-  /// those fields blank looks unfinished even though the money is right.
-  Future<(String, String)> _placement(String studentId) async {
-    final db = ref.read(databaseProvider);
-    final enrollment =
-        await ref.read(studentsProvider).activeEnrollment(studentId);
-    if (enrollment == null) return ('', '');
-
-    final batch = await (db.select(db.batches)
-          ..where((t) => t.id.equals(enrollment.batchId)))
-        .getSingleOrNull();
-    if (batch == null) return ('', '');
-
-    final schoolClass = await (db.select(db.classes)
-          ..where((t) => t.id.equals(batch.classId)))
-        .getSingleOrNull();
-    return (batch.name, schoolClass?.name ?? '');
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -235,10 +258,20 @@ class _CollectFeeScreenState extends ConsumerState<CollectFeeScreen> {
                         Text('${_dues!.monthsBehind} unpaid month(s)'),
                       for (final invoice in _dues!.unpaidInvoices.take(4))
                         Text(
-                          '${invoice.periodKey} — '
+                          // A guardian reads "July 2026", not "2026-07".
+                          '${ReceiptDocument.monthLabel(invoice.periodKey)} — '
                           '৳${invoice.netAmount - invoice.paidAmount}',
                           style: theme.textTheme.bodySmall,
                         ),
+                      if (_dues!.creditBalance > 0) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          '৳${_dues!.creditBalance} paid in advance — it comes '
+                          'off the next month automatically',
+                          style: theme.textTheme.bodySmall
+                              ?.copyWith(fontWeight: FontWeight.w600),
+                        ),
+                      ],
                     ],
                   ),
                 ),

@@ -10,6 +10,8 @@ import 'package:coaching_ops/data/documents/receipt_document.dart';
 import 'package:coaching_ops/data/finance/expense_service.dart';
 import 'package:coaching_ops/data/finance/fee_service.dart';
 import 'package:coaching_ops/data/finance/ledger_service.dart';
+import 'package:coaching_ops/core/app_settings.dart';
+import 'package:coaching_ops/data/finance/period_lock_service.dart';
 import 'package:coaching_ops/data/inventory/inventory_service.dart';
 import 'package:coaching_ops/data/students/students_repository.dart';
 import 'package:drift/drift.dart' show Value;
@@ -109,6 +111,505 @@ void main() {
     });
   });
 
+  // ===================== Release 2 — §0.1 =====================
+
+  group('paying several months at once (owner Q189/Q190)', () {
+    /// Raises `months` consecutive ৳2500 invoices for one student.
+    Future<Student> owing(int months) async {
+      final student = await admit('Rahim');
+      for (var i = 0; i < months; i++) {
+        await fees.generateMonthlyInvoices(
+          sessionId: sessionId,
+          forMonth: DateTime(2026, 7 + i, 1),
+        );
+      }
+      return student;
+    }
+
+    test('one payment for three months clears all three', () async {
+      final student = await owing(3);
+      expect((await fees.duesFor(student)).totalDue, 7500);
+
+      final result = await fees.collect(
+        studentId: student.id,
+        amount: 7500,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+
+      // The bug this replaces: the whole 7500 was attached to July, which
+      // then read "paid 7500 of 2500", while August and September stayed
+      // unpaid and the student was still shown as two months behind.
+      expect(result.settled, ['2026-07', '2026-08', '2026-09']);
+      expect(result.remainingDue, 0);
+      expect(result.credited, 0);
+
+      final invoices = await db.select(db.invoices).get();
+      expect(invoices.every((i) => i.status == InvoiceStatus.paid), isTrue);
+      expect(invoices.every((i) => i.paidAmount == i.netAmount), isTrue);
+      expect((await fees.duesFor(student)).totalDue, 0);
+      expect((await fees.duesFor(student)).monthsBehind, 0);
+    });
+
+    test('a part payment fills the oldest months and leaves the rest', () async {
+      final student = await owing(3);
+
+      final result = await fees.collect(
+        studentId: student.id,
+        amount: 4000,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+
+      // July in full, half of August, September untouched.
+      expect(result.settled, ['2026-07', '2026-08']);
+      expect(result.remainingDue, 3500);
+
+      final byPeriod = {
+        for (final i in await db.select(db.invoices).get()) i.periodKey: i,
+      };
+      expect(byPeriod['2026-07']!.status, InvoiceStatus.paid);
+      expect(byPeriod['2026-08']!.status, InvoiceStatus.partial);
+      expect(byPeriod['2026-08']!.paidAmount, 1500);
+      expect(byPeriod['2026-09']!.status, InvoiceStatus.unpaid);
+      expect(byPeriod['2026-09']!.paidAmount, 0);
+    });
+
+    test('no invoice is ever recorded as overpaid', () async {
+      final student = await owing(1);
+
+      final result = await fees.collect(
+        studentId: student.id,
+        amount: 4000,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+
+      final invoice = (await db.select(db.invoices).get()).single;
+      expect(invoice.paidAmount, 2500);
+      expect(invoice.paidAmount, lessThanOrEqualTo(invoice.netAmount));
+
+      // The surplus is held, not absorbed.
+      expect(result.credited, 1500);
+      final credit = (await db.select(db.studentCredits).get()).single;
+      expect(credit.amount, 1500);
+      expect(credit.studentId, student.id);
+    });
+
+    test('the receipt names the months the money cleared', () async {
+      final student = await owing(2);
+      final result = await fees.collect(
+        studentId: student.id,
+        amount: 5000,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+
+      final html = ReceiptDocument(engine: const DocumentEngine()).build(
+        payment: result.payment,
+        student: student,
+        previousDue: 5000,
+        settledPeriods: result.settled,
+        remainingDue: result.remainingDue,
+        credited: result.credited,
+      );
+
+      expect(html, contains('July 2026, August 2026'));
+      expect(html, contains('Remaining due'));
+    });
+
+    test('an advance is spent on the next month, as the receipt promised',
+        () async {
+      final student = await owing(1); // July, ৳2500
+      final result = await fees.collect(
+        studentId: student.id,
+        amount: 4000,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+      expect(result.credited, 1500);
+      expect((await fees.duesFor(student)).creditBalance, 1500);
+
+      // August arrives. The ৳1500 the receipt said was "kept as advance" has
+      // to come off it — otherwise the guardian is billed for money already
+      // in the drawer.
+      await fees.generateMonthlyInvoices(
+        sessionId: sessionId,
+        forMonth: DateTime(2026, 8, 1),
+      );
+
+      final due = await fees.duesFor(student);
+      expect(due.totalDue, 1000);
+      expect(due.creditBalance, 0);
+
+      final august = (await db.select(db.invoices).get())
+          .firstWhere((i) => i.periodKey == '2026-08');
+      expect(august.paidAmount, 1500);
+      expect(august.status, InvoiceStatus.partial);
+    });
+
+    test('money paid before any invoice exists waits for one', () async {
+      final student = await admit('Rahim');
+
+      final result = await fees.collect(
+        studentId: student.id,
+        amount: 5000,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+      expect(result.settled, isEmpty);
+      expect(result.credited, 5000);
+
+      await fees.generateMonthlyInvoices(
+        sessionId: sessionId,
+        forMonth: DateTime(2026, 7, 1),
+      );
+      await fees.generateMonthlyInvoices(
+        sessionId: sessionId,
+        forMonth: DateTime(2026, 8, 1),
+      );
+
+      expect((await fees.duesFor(student)).totalDue, 0);
+      expect((await fees.duesFor(student)).creditBalance, 0);
+    });
+
+    test('credit already held is used before new money', () async {
+      final student = await owing(1);
+      await fees.collect(
+        studentId: student.id,
+        amount: 3000, // ৳500 over
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+
+      // A charge raised by some other route, with the credit still sitting
+      // unspent — then the guardian pays again.
+      await db.into(db.invoices).insert(
+            InvoicesCompanion.insert(
+              studentId: student.id,
+              sessionId: sessionId,
+              periodKey: '2026-08',
+              issuedOn: DateTime(2026, 8, 1),
+              status: InvoiceStatus.unpaid,
+              deviceId: device,
+              grossAmount: const Value(2500),
+              netAmount: const Value(2500),
+            ),
+          );
+
+      final result = await fees.collect(
+        studentId: student.id,
+        amount: 2000,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+
+      // ৳500 credit + ৳2000 new = ৳2500: August is settled, nothing held.
+      expect(result.remainingDue, 0);
+      expect(result.credited, 0);
+      expect(result.creditUsed, 500);
+      expect((await fees.duesFor(student)).creditBalance, 0);
+
+      // And the receipt shows where the other ৳500 came from, so
+      // "previous due 2500, paid 2000, remaining 0" adds up on paper.
+      final html = ReceiptDocument(engine: const DocumentEngine()).build(
+        payment: result.payment,
+        student: student,
+        previousDue: 2500,
+        settledPeriods: result.settled,
+        remainingDue: result.remainingDue,
+        creditUsed: result.creditUsed,
+      );
+      expect(html, contains('Advance used'));
+      expect(html, contains('৳ 500'));
+    });
+
+    test('voiding the payment that made a credit undoes what it paid for',
+        () async {
+      final student = await owing(1);
+      final result = await fees.collect(
+        studentId: student.id,
+        amount: 4000,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+      await fees.generateMonthlyInvoices(
+        sessionId: sessionId,
+        forMonth: DateTime(2026, 8, 1),
+      );
+      expect((await fees.duesFor(student)).totalDue, 1000);
+
+      await fees.cancelPayment(result.payment, reason: 'Wrong student');
+
+      // Both July and the part of August the advance covered are owed again.
+      expect((await fees.duesFor(student)).totalDue, 5000);
+      expect((await fees.duesFor(student)).creditBalance, 0);
+    });
+
+    test('a duplicate receipt says what the original said', () async {
+      final student = await owing(1); // July
+      final result = await fees.collect(
+        studentId: student.id,
+        amount: 4000,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+
+      // The advance is later spent on August.
+      await fees.generateMonthlyInvoices(
+        sessionId: sessionId,
+        forMonth: DateTime(2026, 8, 1),
+      );
+
+      // The original said "July, ৳1500 kept as advance". A reprint must not
+      // start claiming the receipt was for July and August.
+      final id = result.payment.id;
+      expect(await fees.periodsSettledBy(id), ['2026-07']);
+      expect(await fees.advanceCreatedBy(id), 1500);
+      expect(
+        await fees.periodsSettledBy(id, includeAdvance: true),
+        ['2026-07', '2026-08'],
+      );
+    });
+
+    test('voiding a multi-month payment puts every month back', () async {
+      final student = await owing(3);
+      final result = await fees.collect(
+        studentId: student.id,
+        amount: 7500,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+      expect((await fees.duesFor(student)).totalDue, 0);
+
+      await fees.cancelPayment(result.payment, reason: 'Entered twice');
+
+      expect((await fees.duesFor(student)).totalDue, 7500);
+      final invoices = await db.select(db.invoices).get();
+      expect(invoices.every((i) => i.paidAmount == 0), isTrue);
+      expect(invoices.every((i) => i.status == InvoiceStatus.unpaid), isTrue);
+
+      // The receipt number is spent for good, and the ledger nets to nothing.
+      expect(await ledger.balanceOf(cashId), 0);
+    });
+
+    test('an overpayment credit dies with the payment that made it', () async {
+      final student = await owing(1);
+      final result = await fees.collect(
+        studentId: student.id,
+        amount: 4000,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+      expect(await db.select(db.studentCredits).get(), hasLength(1));
+
+      await fees.cancelPayment(result.payment, reason: 'Wrong student');
+
+      final live = await (db.select(db.studentCredits)
+            ..where((t) => t.deletedAt.isNull()))
+          .get();
+      expect(live, isEmpty);
+    });
+  });
+
+  group('Release 2 — §0.2–§0.6 defects', () {
+    test('a day closing respects the month lock like every other write',
+        () async {
+      final locks = PeriodLockService(db: db, deviceId: device);
+      await locks.lock(DateTime(2026, 3, 1), by: 'Owner');
+
+      // Every other money write already asserted this; closeDay did not, so a
+      // closed month could still be re-closed with different figures.
+      await expectLater(
+        expenses.closeDay(
+          accountId: cashId,
+          countedAmount: 1000,
+          forDay: DateTime(2026, 3, 20),
+        ),
+        throwsA(isA<PeriodLockedException>()),
+      );
+    });
+
+    test('receipt numbers follow the configured prefix', () async {
+      final student = await admit('Rahim');
+
+      // The centre renames its receipt book mid-year.
+      await db.into(db.settings).insert(
+            SettingsCompanion.insert(
+              key: AppSettings.receiptPrefix,
+              value: const Value('AEC'),
+              deviceId: device,
+            ),
+          );
+
+      final payment = (await fees.collect(
+        studentId: student.id,
+        amount: 100,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      )).payment;
+
+      // Previously this read "the first row of receipt_series" and would have
+      // handed back R-00001 from the old book.
+      expect(payment.receiptNo, startsWith('AEC-'));
+
+      final series = await db.select(db.receiptSeries).get();
+      expect(series.map((r) => r.prefix), containsAll(<String>['R', 'AEC']));
+    });
+
+    test('correcting attendance records what each mark used to be', () async {
+      final student = await admit('Rahim');
+      final attendance = AttendanceService(db: db, deviceId: device);
+
+      final session = await attendance.openSession(
+        batchId: batchId,
+        on: DateTime(2026, 3, 2),
+      );
+      await attendance.saveSession(
+        sessionId: session.id,
+        states: {student.id: AttendanceState.absent},
+      );
+
+      // The guardian rings to say the child was there; the register is fixed.
+      await attendance.saveSession(
+        sessionId: session.id,
+        states: {student.id: AttendanceState.present},
+      );
+
+      // The detail lives in the audit log; change_log carries the sync oplog.
+      final log = await (db.select(db.auditLog)
+            ..where((t) => t.entityId.equals(session.id)))
+          .get();
+
+      final correction =
+          log.where((c) => c.action == 'attendance_corrected').single;
+      expect(correction.beforeJson, contains('absent'));
+      expect(correction.afterJson, contains('absent→present'));
+
+      // The first save is not a correction: no before-state, and no list of
+      // every student as "changed".
+      final first = log.where((c) => c.action == 'attendance_saved').single;
+      expect(first.beforeJson, isNull);
+      expect(first.afterJson, isNot(contains('changed')));
+    });
+
+    test('saving an unchanged register is not logged as a correction',
+        () async {
+      final student = await admit('Rahim');
+      final attendance = AttendanceService(db: db, deviceId: device);
+      final session = await attendance.openSession(
+        batchId: batchId,
+        on: DateTime(2026, 3, 2),
+      );
+      final marks = {student.id: AttendanceState.present};
+
+      await attendance.saveSession(sessionId: session.id, states: marks);
+      await attendance.saveSession(sessionId: session.id, states: marks);
+
+      final actions = (await (db.select(db.auditLog)
+                ..where((t) => t.entityId.equals(session.id)))
+              .get())
+          .map((c) => c.action);
+      expect(actions, isNot(contains('attendance_corrected')));
+      expect(actions, contains('attendance_resaved'));
+    });
+
+    test('a student dropped from a saved register is recorded', () async {
+      final rahim = await admit('Rahim');
+      final karima = await admit('Karima');
+      final attendance = AttendanceService(db: db, deviceId: device);
+      final session = await attendance.openSession(
+        batchId: batchId,
+        on: DateTime(2026, 3, 2),
+      );
+
+      await attendance.saveSession(sessionId: session.id, states: {
+        rahim.id: AttendanceState.present,
+        karima.id: AttendanceState.present,
+      });
+      await attendance.saveSession(sessionId: session.id, states: {
+        rahim.id: AttendanceState.present,
+      });
+
+      final correction = (await (db.select(db.auditLog)
+                ..where((t) => t.entityId.equals(session.id)))
+              .get())
+          .where((c) => c.action == 'attendance_corrected')
+          .single;
+      expect(correction.afterJson, contains('present→removed'));
+      expect(correction.afterJson, contains(karima.id));
+    });
+  });
+
+  group('money in and money out', () {
+    test('voiding a fee reduces what was collected — it is not spending',
+        () async {
+      final student = await admit('Rahim');
+      final result = await fees.collect(
+        studentId: student.id,
+        amount: 2000,
+        method: PaymentMethod.cash,
+        accountId: cashId,
+      );
+      await fees.cancelPayment(result.payment, reason: 'Wrong student');
+
+      final now = DateTime.now();
+      final totals = await ledger.totalsBetween(
+        DateTime(now.year, now.month, now.day),
+        DateTime(now.year, now.month, now.day + 1),
+      );
+
+      // The Finance screen used to read "Collected ৳2000, Spent ৳2000" for
+      // this — an expense that never happened.
+      expect(totals.income, 0);
+      expect(totals.expense, 0);
+    });
+
+    test('voiding an expense reduces spending — it is not income', () async {
+      final head = (await db.select(db.expenseHeads).get()).first;
+      final expense = await expenses.record(
+        headId: head.id,
+        accountId: cashId,
+        amount: 800,
+      );
+      await expenses.cancel(expense, reason: 'Entered twice');
+
+      final now = DateTime.now();
+      final totals = await ledger.totalsBetween(
+        DateTime(now.year, now.month, now.day),
+        DateTime(now.year, now.month, now.day + 1),
+      );
+      expect(totals.income, 0);
+      expect(totals.expense, 0);
+    });
+
+    test('moving money between accounts is neither income nor expense',
+        () async {
+      final bkash = (await db.select(db.accounts).get())
+          .firstWhere((a) => a.kind == AccountKind.bkash);
+      final now = DateTime.now();
+      await ledger.post(
+        accountId: cashId,
+        amount: -1000,
+        kind: LedgerKind.transfer,
+        occurredOn: now,
+      );
+      await ledger.post(
+        accountId: bkash.id,
+        amount: 1000,
+        kind: LedgerKind.transfer,
+        occurredOn: now,
+      );
+
+      final totals = await ledger.totalsBetween(
+        DateTime(now.year, now.month, now.day),
+        DateTime(now.year, now.month, now.day + 1),
+      );
+      expect(totals.income, 0);
+      expect(totals.expense, 0);
+    });
+  });
+
   // ===================== Stage 5 =====================
 
   group('Stage 5 — fees and receipts', () {
@@ -129,6 +630,53 @@ void main() {
       );
       expect(again, 0);
       expect(await db.select(db.invoices).get(), hasLength(2));
+    });
+
+    test('raising fees names the students it could not bill', () async {
+      // A centre fresh from setup: the batch has no fee and neither does the
+      // student. Previously this reported "everyone was already billed".
+      await (db.update(db.batches)..where((t) => t.id.equals(batchId)))
+          .write(const BatchesCompanion(monthlyFee: Value(0)));
+      await admit('Rahim');
+
+      final result = await fees.raiseMonthlyFees(
+        sessionId: sessionId,
+        forMonth: DateTime(2026, 3, 1),
+      );
+
+      expect(result.created, 0);
+      expect(result.alreadyBilled, 0);
+      expect(result.withoutFee, ['Rahim']);
+    });
+
+    test('a second run reports who was already billed', () async {
+      await admit('Rahim');
+      await fees.raiseMonthlyFees(
+        sessionId: sessionId,
+        forMonth: DateTime(2026, 3, 1),
+      );
+      final again = await fees.raiseMonthlyFees(
+        sessionId: sessionId,
+        forMonth: DateTime(2026, 3, 1),
+      );
+      expect(again.created, 0);
+      expect(again.alreadyBilled, 1);
+      expect(again.withoutFee, isEmpty);
+    });
+
+    test("invoices fall due on the centre's own day, not a built-in one",
+        () async {
+      await admit('Rahim');
+      await AppSettings(db: db, deviceId: device)
+          .write(AppSettings.defaultDueDay, '5');
+
+      await fees.raiseMonthlyFees(
+        sessionId: sessionId,
+        forMonth: DateTime(2026, 3, 1),
+      );
+
+      final invoice = (await db.select(db.invoices).get()).single;
+      expect(invoice.dueOn, DateTime(2026, 3, 5));
     });
 
     test('a discount reduces the invoice and is recorded', () async {
@@ -158,12 +706,12 @@ void main() {
       final student = await admit('Rahim');
       final receipts = <String>[];
       for (var i = 0; i < 5; i++) {
-        final p = await fees.collect(
+        final p = (await fees.collect(
           studentId: student.id,
           amount: 500,
           method: PaymentMethod.cash,
           accountId: cashId,
-        );
+        )).payment;
         receipts.add(p.receiptNo);
       }
 
@@ -180,12 +728,12 @@ void main() {
           .firstWhere((p) => p.receiptNo == 'R-00003');
       await fees.cancelPayment(third, reason: 'Counted twice');
 
-      final next = await fees.collect(
+      final next = (await fees.collect(
         studentId: student.id,
         amount: 100,
         method: PaymentMethod.cash,
         accountId: cashId,
-      );
+      )).payment;
       expect(next.receiptNo, 'R-00006');
     });
 
@@ -263,13 +811,13 @@ void main() {
     test('a receipt renders with amount in words and correct grouping',
         () async {
       final student = await admit('Rahim Ahmed');
-      final payment = await fees.collect(
+      final payment = (await fees.collect(
         studentId: student.id,
         amount: 125000,
         method: PaymentMethod.bkash,
         accountId: cashId,
         receivedBy: 'Reception',
-      );
+      )).payment;
 
       final html = ReceiptDocument(engine: const DocumentEngine())
           .build(payment: payment, student: student, previousDue: 130000);
@@ -351,12 +899,12 @@ void main() {
       final student = await admit('Rahim');
       final head = (await db.select(db.expenseHeads).get()).first;
 
-      final p1 = await fees.collect(
+      final p1 = (await fees.collect(
         studentId: student.id,
         amount: 2500,
         method: PaymentMethod.cash,
         accountId: cashId,
-      );
+      )).payment;
       await fees.collect(
         studentId: student.id,
         amount: 1500,
@@ -391,12 +939,12 @@ void main() {
 
     test('cancelling twice does not double-reverse', () async {
       final student = await admit('Rahim');
-      final payment = await fees.collect(
+      final payment = (await fees.collect(
         studentId: student.id,
         amount: 2000,
         method: PaymentMethod.cash,
         accountId: cashId,
-      );
+      )).payment;
 
       await fees.cancelPayment(payment, reason: 'Mistake');
       final refreshed = (await db.select(db.payments).get()).single;
@@ -616,14 +1164,14 @@ void main() {
       await fees.generateMonthlyInvoices(
           sessionId: sessionId, forMonth: DateTime(2026, 3, 1));
       final invoice = (await db.select(db.invoices).get()).single;
-      final payment = await fees.collect(
+      final payment = (await fees.collect(
         studentId: student.id,
         invoiceId: invoice.id,
         amount: 2500,
         method: PaymentMethod.cash,
         accountId: cashId,
         forPeriod: 'March 2026',
-      );
+      )).payment;
 
       // Due updated, finance updated, receipt allocated
       expect((await fees.duesFor(student)).totalDue, 0);

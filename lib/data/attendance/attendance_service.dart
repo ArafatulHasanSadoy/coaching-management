@@ -64,11 +64,20 @@ class AttendanceService {
   /// Deletes and reinserts rather than diffing: a class is thirty to fifty
   /// rows, the write is one batch, and the alternative is a merge that can
   /// leave a student silently unmarked.
+  ///
+  /// The audit entry carries what actually *changed*, per student, not just
+  /// how many were marked. A register that is corrected after the class is
+  /// normal; a register that cannot say what it used to read is not a record.
   Future<void> saveSession({
     required String sessionId,
     required Map<String, AttendanceState> states,
   }) async {
     await db.transaction(() async {
+      final before = await (db.select(db.attendanceRecords)
+            ..where((t) => t.classSessionId.equals(sessionId)))
+          .get();
+      final was = {for (final r in before) r.studentId: r.state};
+
       await (db.delete(db.attendanceRecords)
             ..where((t) => t.classSessionId.equals(sessionId)))
           .go();
@@ -88,13 +97,47 @@ class AttendanceService {
       final absent =
           states.values.where((s) => s == AttendanceState.absent).length;
 
+      // Only students whose mark moved — and only on a correction. The first
+      // save has nothing to compare against, and listing every student in the
+      // class as "unmarked→present" would bury the corrections that matter.
+      final changed = <String, String>{};
+      if (was.isNotEmpty) {
+        for (final entry in states.entries) {
+          final old = was[entry.key];
+          if (old != entry.value) {
+            changed[entry.key] =
+                '${old?.name ?? 'unmarked'}→${entry.value.name}';
+          }
+        }
+        // Someone who was on the register and is no longer on it has not
+        // stopped existing; that is a change too.
+        for (final entry in was.entries) {
+          if (!states.containsKey(entry.key)) {
+            changed[entry.key] = '${entry.value.name}→removed';
+          }
+        }
+      }
+
+      final action = was.isEmpty
+          ? 'attendance_saved'
+          : changed.isEmpty
+              ? 'attendance_resaved'
+              : 'attendance_corrected';
+
       await db.recordChange(
         entity: 'class_sessions',
         entityId: sessionId,
         op: ChangeOp.update,
         deviceId: deviceId,
-        action: 'attendance_saved',
-        after: {'marked': states.length, 'absent': absent},
+        action: action,
+        before: was.isEmpty
+            ? null
+            : {for (final e in was.entries) e.key: e.value.name},
+        after: {
+          'marked': states.length,
+          'absent': absent,
+          if (changed.isNotEmpty) 'changed': changed,
+        },
       );
     });
   }

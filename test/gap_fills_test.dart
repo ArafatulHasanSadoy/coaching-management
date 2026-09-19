@@ -110,13 +110,13 @@ void main() {
       final student = await admit('Rahim');
       await locks.lock(DateTime(2026, 3));
 
-      final payment = await fees.collect(
+      final payment = (await fees.collect(
         studentId: student.id,
         amount: 2500,
         method: PaymentMethod.cash,
         accountId: cashId,
         receivedOn: DateTime(2026, 4, 1),
-      );
+      )).payment;
       expect(payment.receiptNo, isNotEmpty);
     });
 
@@ -126,13 +126,13 @@ void main() {
       final lock = (await locks.locked()).single;
       await locks.unlock(lock, reason: 'Late receipt found');
 
-      final payment = await fees.collect(
+      final payment = (await fees.collect(
         studentId: student.id,
         amount: 500,
         method: PaymentMethod.cash,
         accountId: cashId,
         receivedOn: DateTime(2026, 3, 20),
-      );
+      )).payment;
       expect(payment.amount, 500);
 
       final trail = await (db.select(db.auditLog)
@@ -143,13 +143,13 @@ void main() {
 
     test('a cancelled receipt in a closed month is refused too', () async {
       final student = await admit('Rahim');
-      final payment = await fees.collect(
+      final payment = (await fees.collect(
         studentId: student.id,
         amount: 2500,
         method: PaymentMethod.cash,
         accountId: cashId,
         receivedOn: DateTime(2026, 3, 5),
-      );
+      )).payment;
       await locks.lock(DateTime(2026, 3));
 
       await expectLater(
@@ -459,13 +459,13 @@ void main() {
         accountId: cashId,
         receivedOn: DateTime(2026, 3, 5),
       );
-      final voided = await fees.collect(
+      final voided = (await fees.collect(
         studentId: student.id,
         amount: 900,
         method: PaymentMethod.cash,
         accountId: cashId,
         receivedOn: DateTime(2026, 3, 6),
-      );
+      )).payment;
       await fees.cancelPayment(voided, reason: 'Duplicate');
 
       final report = await ReportsService(db: db, deviceId: device)

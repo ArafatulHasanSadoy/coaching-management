@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/bootstrap.dart';
 import '../../core/phone.dart';
+import '../../core/period.dart';
 import '../../core/sections.dart';
 import '../../data/finance/fee_service.dart';
 import 'collect_fee_screen.dart';
@@ -49,15 +50,15 @@ class _DuesScreenState extends ConsumerState<DuesScreen> {
     if (session == null || !mounted) return;
 
     final now = DateTime.now();
-    final label = '${now.month}/${now.year}';
+    final label = monthLabel(FeeService.periodKeyFor(now));
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text('Raise fees for $label?'),
         content: const Text(
-          'Every student enrolled in an active batch gets an invoice for their '
-          'batch fee, minus any discount. Students already billed for this '
-          'month are skipped, so this is safe to run again.',
+          'Every enrolled student gets an invoice for their own monthly fee, '
+          'minus any discount. Anyone already billed for this month is '
+          'skipped, so this is safe to run again.',
         ),
         actions: [
           TextButton(
@@ -73,22 +74,55 @@ class _DuesScreenState extends ConsumerState<DuesScreen> {
     );
     if (confirmed != true) return;
 
-    final created = await ref.read(feeServiceProvider).generateMonthlyInvoices(
+    final result = await ref.read(feeServiceProvider).raiseMonthlyFees(
           sessionId: session.id,
           forMonth: DateTime(now.year, now.month),
         );
     if (!mounted) return;
 
+    _reload();
+
+    // Students with no fee are the case that matters: a new centre that has
+    // not set fees yet would otherwise be told billing is done.
+    if (result.withoutFee.isNotEmpty) {
+      await showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(result.created == 0
+              ? 'Nobody was billed'
+              : '${result.created} billed — ${result.withoutFee.length} skipped'),
+          content: Text(
+            '${result.withoutFee.length} student(s) have no monthly fee set, '
+            'so there was nothing to charge them:\n\n'
+            '${result.withoutFee.take(8).join(', ')}'
+            '${result.withoutFee.length > 8 ? ' and ${result.withoutFee.length - 8} more' : ''}'
+            '\n\nSet a fee on each student (Students → the student → Edit '
+            'details) or on their batch, then raise fees again. Anyone already '
+            'billed is skipped.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Got it'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
-          created == 0
-              ? 'Everyone was already billed for $label.'
-              : '$created invoice(s) raised for $label.',
+          result.created > 0
+              ? '${result.created} invoice(s) raised for $label.'
+              : result.alreadyBilled > 0
+                  ? 'Everyone was already billed for $label.'
+                  : 'No one is enrolled in a batch yet, so there was no one '
+                      'to bill.',
         ),
       ),
     );
-    _reload();
   }
 
   @override
@@ -164,10 +198,11 @@ class _DuesScreenState extends ConsumerState<DuesScreen> {
                           final due = list[i];
                           return ListTile(
                             title: Text(due.student.name),
-                            subtitle: Text(
-                              '${due.monthsBehind} month(s) · '
-                              '${Phone.forDisplay(due.student.guardianPhone)}',
-                            ),
+                            subtitle: Text([
+                              '${due.monthsBehind} month(s)',
+                              if (due.student.guardianPhone.isNotEmpty)
+                                Phone.forDisplay(due.student.guardianPhone),
+                            ].join(' · ')),
                             trailing: Text(
                               '৳${due.totalDue}',
                               style: theme.textTheme.titleMedium?.copyWith(

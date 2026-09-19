@@ -1,3 +1,4 @@
+import '../../core/period.dart' as period;
 import '../db/database.dart';
 import '../db/tables.dart';
 import 'document_engine.dart';
@@ -20,8 +21,20 @@ class ReceiptDocument {
     String className = '',
     int previousDue = 0,
     bool isDuplicate = false,
+    List<String> settledPeriods = const [],
+    int? remainingDue,
+    int credited = 0,
+    int creditUsed = 0,
   }) {
-    final remaining = previousDue - payment.amount;
+    // "Which months did my payment cover?" is the hardest question the front
+    // desk is asked, and the one it used to have to answer from memory. The
+    // months this payment actually settled are printed on the receipt so the
+    // guardian leaves holding the answer.
+    final forLine = settledPeriods.isNotEmpty
+        ? settledPeriods.map(period.monthLabel).join(', ')
+        : payment.forPeriod;
+
+    final remaining = remainingDue ?? (previousDue - payment.amount);
     final body = '''
 ${isDuplicate ? '<div class="stamp">DUPLICATE</div>' : ''}
 <div class="doc-title">MONEY RECEIPT &nbsp;/&nbsp; মানি রসিদ</div>
@@ -33,13 +46,15 @@ ${isDuplicate ? '<div class="stamp">DUPLICATE</div>' : ''}
       <td>Student ID</td><td>${DocumentEngine.escape(student.code)}</td></tr>
   <tr><td>Class</td><td>${DocumentEngine.escape(className)}</td>
       <td>Batch</td><td>${DocumentEngine.escape(batchName)}</td></tr>
-  ${payment.forPeriod.isEmpty ? '' : '<tr><td>For</td><td colspan="3">${DocumentEngine.escape(payment.forPeriod)}</td></tr>'}
+  ${forLine.isEmpty ? '' : '<tr><td>For</td><td colspan="3"><b>${DocumentEngine.escape(forLine)}</b></td></tr>'}
 </table>
 
 <table class="totals">
   ${previousDue > 0 ? '<tr><td>Previous due</td><td align="right">${_taka(previousDue)}</td></tr>' : ''}
+  ${creditUsed > 0 ? '<tr><td>Advance used</td><td align="right">${_taka(creditUsed)}</td></tr>' : ''}
   <tr class="grand"><td>Paid now</td><td align="right">${_taka(payment.amount)}</td></tr>
   ${previousDue > 0 ? '<tr><td>Remaining due</td><td align="right">${_taka(remaining < 0 ? 0 : remaining)}</td></tr>' : ''}
+  ${credited > 0 ? '<tr><td>Kept as advance</td><td align="right">${_taka(credited)}</td></tr>' : ''}
   <tr><td>In words</td><td align="right">${DocumentEngine.escape(takaInWords(payment.amount))}</td></tr>
   <tr><td>Payment method</td><td align="right">${_method(payment.method)}</td></tr>
   ${payment.reference.isEmpty ? '' : '<tr><td>Reference</td><td align="right">${DocumentEngine.escape(payment.reference)}</td></tr>'}
@@ -57,6 +72,9 @@ ${isDuplicate ? '<div class="stamp">DUPLICATE</div>' : ''}
       paper: PaperSize.a5,
     );
   }
+
+  /// `2026-07` → `July 2026`. Guardians do not read period keys.
+  static String monthLabel(String periodKey) => period.monthLabel(periodKey);
 
   static String _taka(int amount) => '৳ ${_grouped(amount)}';
 

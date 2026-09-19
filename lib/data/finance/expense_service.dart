@@ -167,6 +167,12 @@ class ExpenseService {
     String closedBy = '',
   }) async {
     final day = forDay ?? DateTime.now();
+
+    // Every other money write checks this; a day closing is a money record
+    // like any other, and closing a day inside a month the owner has already
+    // reported would change figures they have handed out.
+    await _locks.assertOpen(day);
+
     final expected = await _ledger.balanceOf(accountId);
 
     final closing = await db.into(db.dailyClosings).insertReturning(

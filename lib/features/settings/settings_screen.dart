@@ -56,6 +56,36 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             },
           ),
 
+          const _Heading('Fees'),
+          FutureBuilder<List<String>>(
+            future: Future.wait([
+              ref.read(settingsProvider).read(AppSettings.defaultDueDay),
+              ref.read(settingsProvider).read(AppSettings.receiptPrefix),
+            ]),
+            builder: (context, snapshot) {
+              final values = snapshot.data;
+              if (values == null) return const SizedBox.shrink();
+              final dueDay = values[0];
+              final prefix = values[1];
+              return Column(
+                children: [
+                  ListTile(
+                    title: const Text('Fees are due by'),
+                    subtitle: Text('Day $dueDay of each month'),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () => _editDueDay(int.tryParse(dueDay) ?? 10),
+                  ),
+                  ListTile(
+                    title: const Text('Receipt numbers'),
+                    subtitle: Text('$prefix-00001, $prefix-00002 …'),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () => _editReceiptPrefix(prefix),
+                  ),
+                ],
+              );
+            },
+          ),
+
           const _Heading('Accounting'),
           ListTile(
             title: const Text('Closed months'),
@@ -189,6 +219,109 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         .read(settingsProvider)
         .write(AppSettings.autoLockMinutes, '$chosen');
     ref.read(lockControllerProvider.notifier).setIdleMinutes(chosen);
+    setState(() => _reloads++);
+  }
+
+  /// Every centre collects by its own day of the month; it drives when an
+  /// invoice counts as overdue.
+  Future<void> _editDueDay(int current) async {
+    final chosen = await showDialog<int>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Fees are due by'),
+        children: [
+          SizedBox(
+            width: 280,
+            child: GridView.count(
+              crossAxisCount: 7,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              padding: const EdgeInsets.all(12),
+              children: [
+                // 28 at most, so the day exists in every month.
+                for (var day = 1; day <= 28; day++)
+                  InkWell(
+                    borderRadius: BorderRadius.circular(20),
+                    onTap: () => Navigator.pop(context, day),
+                    child: Center(
+                      child: CircleAvatar(
+                        radius: 16,
+                        backgroundColor: day == current
+                            ? Section.money.colour
+                            : Colors.transparent,
+                        foregroundColor:
+                            day == current ? Colors.white : null,
+                        child: Text('$day'),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+    if (chosen == null) return;
+    await ref
+        .read(settingsProvider)
+        .write(AppSettings.defaultDueDay, '$chosen');
+    setState(() => _reloads++);
+  }
+
+  /// The letters in front of every receipt number. Changing it starts a new
+  /// book at 1; the old one keeps its numbers.
+  Future<void> _editReceiptPrefix(String current) async {
+    final controller = TextEditingController(text: current);
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Receipt numbers'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: controller,
+              autofocus: true,
+              textCapitalization: TextCapitalization.characters,
+              maxLength: 8,
+              decoration: const InputDecoration(
+                labelText: 'Starts with',
+                hintText: 'R',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const Text(
+              'A new prefix starts a new receipt book from 1. Receipts already '
+              'written keep their numbers.',
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    final value = controller.text.trim().toUpperCase();
+    if (saved != true || value.isEmpty || value == current) return;
+    // Letters, digits and dashes only: it is printed and read aloud.
+    if (!RegExp(r'^[A-Z0-9-]+$').hasMatch(value)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Use letters, numbers or a dash only.'),
+        ),
+      );
+      return;
+    }
+    await ref.read(settingsProvider).write(AppSettings.receiptPrefix, value);
     setState(() => _reloads++);
   }
 

@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/bootstrap.dart';
 import '../../app/lock_controller.dart';
+import '../../core/money_guard.dart';
 import '../../core/sections.dart';
 import '../../data/db/database.dart';
 
@@ -127,9 +128,143 @@ class _FinanceScreenState extends ConsumerState<FinanceScreen> {
             'Tap an account to count it and close the day.',
             style: theme.textTheme.bodySmall,
           ),
+          const SizedBox(height: 20),
+          Text('Expenses this month', style: theme.textTheme.titleMedium),
+          const SizedBox(height: 8),
+          FutureBuilder<List<(Expense, String)>>(
+            future: _monthExpenses(monthStart),
+            builder: (context, snapshot) {
+              final rows = snapshot.data;
+              if (rows == null) return const SizedBox.shrink();
+              if (rows.isEmpty) {
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  child: Text('Nothing spent yet this month.',
+                      style: theme.textTheme.bodySmall),
+                );
+              }
+              return Card(
+                child: Column(
+                  children: [
+                    for (final (expense, head) in rows)
+                      ListTile(
+                        dense: true,
+                        title: Text(
+                          head,
+                          style: TextStyle(
+                            decoration: expense.isCancelled
+                                ? TextDecoration.lineThrough
+                                : null,
+                          ),
+                        ),
+                        subtitle: Text([
+                          '${expense.spentOn.day}/${expense.spentOn.month}',
+                          if (expense.paidTo.isNotEmpty) expense.paidTo,
+                          if (expense.isCancelled) 'voided',
+                        ].join(' · ')),
+                        trailing: Text(
+                          '৳${expense.amount}',
+                          style: TextStyle(
+                            color: expense.isCancelled
+                                ? theme.colorScheme.outline
+                                : theme.colorScheme.error,
+                          ),
+                        ),
+                        onTap: expense.isCancelled
+                            ? null
+                            : () => _voidExpense(context, expense, head),
+                      ),
+                  ],
+                ),
+              );
+            },
+          ),
+          const SizedBox(height: 80),
         ],
       ),
     );
+  }
+
+  /// This month's expenses with the name each should be read by.
+  Future<List<(Expense, String)>> _monthExpenses(DateTime monthStart) async {
+    final db = ref.read(databaseProvider);
+    final expenses = await ref.read(expenseServiceProvider).between(
+          monthStart,
+          DateTime(monthStart.year, monthStart.month + 1),
+        );
+    final heads = {
+      for (final h in await db.select(db.expenseHeads).get()) h.id: h.name,
+    };
+    return [
+      for (final e in expenses)
+        (
+          e,
+          e.customHead.isNotEmpty
+              ? e.customHead
+              : heads[e.headId] ?? 'Expense',
+        ),
+    ];
+  }
+
+  /// Voids an expense typed by mistake. The row stays, the money comes back.
+  Future<void> _voidExpense(
+    BuildContext context,
+    Expense expense,
+    String head,
+  ) async {
+    final reason = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Void ৳${expense.amount} — $head?'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'It stays in the history, marked voided, and the money goes back '
+              'into the account it came out of.',
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: reason,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Why',
+                hintText: 'Entered twice',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Keep it'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+            ),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Void'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !context.mounted) return;
+
+    final done = await runMoneyAction(
+      context,
+      what: 'voiding this expense',
+      () => ref.read(expenseServiceProvider).cancel(
+            expense,
+            reason: reason.text.trim().isEmpty
+                ? 'No reason given'
+                : reason.text.trim(),
+          ),
+    );
+    if (done) _reload();
   }
 
   Future<List<Account>> _accounts() {
@@ -249,13 +384,19 @@ class _FinanceScreenState extends ConsumerState<FinanceScreen> {
     final value = int.tryParse(amount.text.trim()) ?? 0;
     if (value <= 0) return;
 
-    await ref.read(expenseServiceProvider).record(
-          headId: headId,
-          accountId: accountId,
-          amount: value,
-          paidTo: paidTo.text.trim(),
-          customHead: isOther(headId) ? customHead.text.trim() : '',
-        );
+    if (!context.mounted) return;
+    final recorded = await runMoneyWrite(
+      context,
+      what: 'this expense',
+      () => ref.read(expenseServiceProvider).record(
+            headId: headId,
+            accountId: accountId,
+            amount: value,
+            paidTo: paidTo.text.trim(),
+            customHead: isOther(headId) ? customHead.text.trim() : '',
+          ),
+    );
+    if (recorded == null) return;
     _reload();
   }
 
@@ -301,12 +442,17 @@ class _FinanceScreenState extends ConsumerState<FinanceScreen> {
     if (ok != true) return;
 
     final user = ref.read(currentUserProvider);
-    final closing = await ref.read(expenseServiceProvider).closeDay(
-          accountId: account.id,
-          countedAmount: int.tryParse(counted.text.trim()) ?? expected,
-          closedBy: user?.name ?? '',
-        );
     if (!context.mounted) return;
+    final closing = await runMoneyWrite(
+      context,
+      what: 'a day closing',
+      () => ref.read(expenseServiceProvider).closeDay(
+            accountId: account.id,
+            countedAmount: int.tryParse(counted.text.trim()) ?? expected,
+            closedBy: user?.name ?? '',
+          ),
+    );
+    if (closing == null || !context.mounted) return;
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
